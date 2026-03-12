@@ -26,3 +26,18 @@ def rotate(img, angle, rotPoint = None):
     rotMat = cv.getRotationMatrix2D(rotPoint, angle, 1.0)
     dimensions = (width, height)
     return cv.warpAffine(img, rotMat, dimensions)
+
+def draw(frame, tuple, color):
+    x, y = tuple
+    color_f = (255, 255, 255)
+    if color == 'red':
+        color_f = (0, 0, 255)
+    elif color == 'green':
+        color_f = (0, 255, 0)
+    elif color == 'blue':
+        color_f = (255, 0, 0)
+    elif color == 'yellow':
+        color_f = (0, 255, 255)
+    elif color == 'purple':
+        color_f = (255, 0, 255)
+    cv.circle(frame, (x, y), 1, color_f, 1)
