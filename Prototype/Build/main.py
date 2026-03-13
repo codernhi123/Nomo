@@ -2,13 +2,15 @@
 # 1. Extract pupil center (x, y) for both eyes
 # 2. Extract eye conners (x, y) for both eyes
 # 3. Normalize nx:  pupil center to eye conners (horizontal)
-# 4. Normalize ny:  pupil center to cheekbone (vertical) - CURRENT
+# 4. Normalize ny:  pupil center to cheekbone (vertical)
 #   4.1. adding calibration key for ny according to frame
-# 5. add EMA filter to smooth out the noise
-# 6. add Kalman filter to stablize the output
-# 7. project the normalized coordinates to the screen (using a simple linear transformation for now, but can be improved with a more complex model)
-# 8. add key for calibration & enabling "INSERT MODE"
-# 9. wraping up MVP and start working on Production version
+#   4.2. making pipeline for screen_projection module part 1 - CURRENT
+#   4.3. add EMA filter to smooth out the noise in the output (for both nx and ny)
+#   4.4. add Kalman filter to stablize the output
+#   4.5. making pipeline for screen_projection module part 2
+# 5. project the normalized coordinates to the screen (using a simple linear transformation for now, but can be improved with a more complex model)
+# 6. add key for calibration & enabling "INSERT MODE"
+# 7. wraping up MVP and start working on Production version
 #--- End of work flow ---
 
 import helper as hp
@@ -34,37 +36,13 @@ landmarker = vision.FaceLandmarker.create_from_options(options)
 print("Landmarker created successfully")
 #End defining
 
-#--- setting up global constants ---
-leftEye = {i for pair in fmc.FACEMESH_LEFT_EYE for i in pair}
-rightEye = {i for pair in fmc.FACEMESH_RIGHT_EYE for i in pair}
-leftIris = {i for pair in fmc.FACEMESH_LEFT_IRIS for i in pair}
-rightIris = {i for pair in fmc.FACEMESH_RIGHT_IRIS for i in pair}
-min_x, min_y = 10**9, 10**9
-max_x, max_y = -1, -1
-
-#--- video figurations ---
-LiveCapture = cv.VideoCapture(0)
+#--- video configurations ---
+LiveCapture = cv.VideoCapture(mf.find_available_cameras(0))
 prevTime = time.time()
 frameTimestampMs = 0
 
-def extract_pupil(w, h, side, faceLandmarks) -> (int, int):
-    x_sum = 0.0
-    y_sum = 0.0
-    cnt = 0
-    for idx, landmark in enumerate(faceLandmarks):
-        if (side == 'left' and idx in leftIris) or (side == 'right' and idx in rightIris):
-            landmark = faceLandmarks[idx]
-            h, w, _ = frame.shape
-            x_sum += int(landmark.x * w)
-            y_sum += int(landmark.y * h)
-            cnt += 1
-    if cnt != 0:
-        return (int(x_sum / cnt), int(y_sum / cnt))
-    
-    return (0, 0)
-
-def cvt_landmark_to_xy(landmark, w, h):
-    return (int(landmark.x * w), int(landmark.y * h))
+glob_v_l_top_eyelid_calibration = (0, 0)
+glob_v_r_top_eyelid_calibration = (0, 0)
 
 while True:
     isTrue, frame = LiveCapture.read()
@@ -76,26 +54,26 @@ while True:
     frameTimestampMs = int(time.time() * 1000)
     results = landmarker.detect_for_video(mp_image, frameTimestampMs)
 
+    h, w, c = frame.shape
     if results.face_landmarks:
         for faceLandmarks in results.face_landmarks:
-            h, w, _ = frame.shape
 
-            #--- pupil extraction: initialize accumulators ---
-            l_pupil_x, l_pupil_y = extract_pupil(w, h, 'left', faceLandmarks)
-            r_pupil_x, r_pupil_y = extract_pupil(w, h, 'right', faceLandmarks)
+            #--- 1. pupil extraction: initialize accumulators ---
+            l_pupil_x, l_pupil_y = mf.extract_pupil(w, h, 'left', faceLandmarks)
+            r_pupil_x, r_pupil_y = mf.extract_pupil(w, h, 'right', faceLandmarks)
 
-            #--- eye conners: initialize boundary points list ---
+            #--- 2. eye conners: initialize boundary points list ---
             r_outer = faceLandmarks[33]
             r_inner = faceLandmarks[133]
             l_outer = faceLandmarks[263]
             l_inner = faceLandmarks[362]
             
-            r_inner_x, r_inner_y = cvt_landmark_to_xy(r_inner, w, h)
-            r_outer_x, r_outer_y = cvt_landmark_to_xy(r_outer, w, h)
-            l_inner_x, l_inner_y = cvt_landmark_to_xy(l_inner, w, h)
-            l_outer_x, l_outer_y = cvt_landmark_to_xy(l_outer, w, h)
-
-            #--- normalizing for both pupils to anchor (horizontal) ---
+            r_inner_x, r_inner_y = hp.cvt_landmark_to_xy(r_inner, w, h)
+            r_outer_x, r_outer_y = hp.cvt_landmark_to_xy(r_outer, w, h)
+            l_inner_x, l_inner_y = hp.cvt_landmark_to_xy(l_inner, w, h)
+            l_outer_x, l_outer_y = hp.cvt_landmark_to_xy(l_outer, w, h)
+            
+            #--- 3. normalizing for both pupils to anchor (horizontal) ---
                 ## right normalization
             r_outer = np.array([r_outer_x, r_outer_y])
             r_inner = np.array([r_inner_x, r_inner_y])
@@ -108,32 +86,52 @@ while True:
             l_nx = mf.horizontal_normalization(l_pupil, l_inner, l_outer, True)
                 ## averaging 
             nx = (l_nx + r_nx) / 2
+            nx = np.clip(nx, 0.0, 1.0)
 
-            #--- y_anchor: initialize vertical boundary points ---
+            #--- 4. y_anchor: initialize vertical boundary points ---
+                ##nose + top forehead + both eyelids for vector projection
             nose = faceLandmarks[1]
-            nose_x, nose_y = cvt_landmark_to_xy(nose, w, h)
-            ## right normalization
-            r_ny = r_pupil_y - nose_y
-            ## left normalization
-            l_ny = l_pupil_y - nose_y
-            ## averaging
+            nose_x, nose_y = hp.cvt_landmark_to_xy(nose, w, h)
+            v_nose = np.array([nose_x, nose_y])
+
+            top_forehead = faceLandmarks[10]
+            top_forehead_x, top_forehead_y = hp.cvt_landmark_to_xy(top_forehead, w, h)
+            v_top_forehead = np.array([top_forehead_x, top_forehead_y])
+
+            l_top_eyelid = faceLandmarks[159]
+            l_top_eyelid_x, l_top_eyelid_y = hp.cvt_landmark_to_xy(l_top_eyelid, w, h)
+            v_l_top_eyelid = np.array([l_top_eyelid_x, l_top_eyelid_y])
+            
+            r_top_eyelid = faceLandmarks[386]
+            r_top_eyelid_x, r_top_eyelid_y = hp.cvt_landmark_to_xy(r_top_eyelid, w, h)
+            v_r_top_eyelid = np.array([r_top_eyelid_x, r_top_eyelid_y])
+
+                ## normal value calibration
+            if cv.waitKey(1) & 0xFF == ord('c'):
+                glob_v_l_top_eyelid_calibration = v_l_top_eyelid
+                glob_v_r_top_eyelid_calibration = v_r_top_eyelid
+                ##left - right & averaging
+            l_ny = mf.vertical_normalization(v_l_top_eyelid, v_top_forehead, v_nose, glob_v_l_top_eyelid_calibration)
+            r_ny = mf.vertical_normalization(v_r_top_eyelid, v_top_forehead, v_nose, glob_v_r_top_eyelid_calibration)
             ny = (l_ny + r_ny) / 2
-            print(l_ny)
+            ny = np.clip(ny, 0.0, 1.0)
 
-            #--- drawing points for debugging ---
-            hp.draw(frame, (r_inner_x, r_inner_y), 'red')
-            hp.draw(frame, (r_outer_x, r_outer_y), 'red')
-            hp.draw(frame, (l_inner_x, l_inner_y), 'red')
-            hp.draw(frame, (l_outer_x, l_outer_y), 'red')
-            hp.draw(frame, (int(l_pupil_x), int(l_pupil_y)), 'white')
-            hp.draw(frame, (int(r_pupil_x), int(r_pupil_y)), 'white')
-            cv.putText(frame, f"ny: {int(ny)}",(20, 40),cv.FONT_HERSHEY_COMPLEX,1,(0, 0, 255), 2)
+            print(f"nx: {nx}, ny: {ny}")
+            
+            ##---=== 4.1 map normal value strictly from [0, 1] ===---
+            # Working in screen_projection module
 
+            ##---=== 4.2 pipeline for screen_projection module part 1 ===---
+            # Working in screen_projection module
+
+
+            #--- 5. drawing points for debugging ---
+            #hp.check_landmark(frame, faceLandmarks)
+            
     curTime = time.time()
     fps = 1/(curTime - prevTime)
     prevTime = curTime
-
-
+    hp.write(frame, "FPS", int(fps), (20, 50), 'green')
     cv.imshow("Face Mesh", frame)
 
     if cv.waitKey(1) & 0xFF==ord('d'):
